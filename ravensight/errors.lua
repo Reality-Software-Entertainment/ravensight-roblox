@@ -134,7 +134,11 @@ function Errors:allow(info)
     self.refilledAt = t
   end
   if self.tokens < 1 then return false end
-  local key = tostring(info.errorType or '') .. '|' .. Errors.template(info.message) .. '|' .. Errors.firstFrame(info.stack)
+  -- Cut to four times the limits before any template or frame work, so a
+  -- huge line costs a bounded amount.
+  local message = cut(tostring(info.message or ''), Errors.MESSAGE_CHARS * 4)
+  local stack = type(info.stack) == 'string' and cut(info.stack, Errors.STACK_CHARS * 4) or nil
+  local key = cut(tostring(info.errorType or ''), Errors.TYPE_CHARS) .. '|' .. Errors.template(message) .. '|' .. Errors.firstFrame(stack)
   local seen = self.perKey[key] or 0
   if seen >= Errors.PER_KEY_CAP then return false end
   self.perKey[key] = seen + 1

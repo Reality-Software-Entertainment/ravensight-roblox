@@ -323,6 +323,36 @@ return {
     eq(events[2].data.rs_message, 'attempt to index nil with Parent at ~/x', 'scrubbed before it is queued')
   end },
 
+  { 'the capture hook comes out when the game switches error capture off', function()
+    local w = world({ responder = function(o)
+      if o.Url:find('/settings', 1, true) then return { StatusCode = 200, Body = '{"trackingEnabled":true}', Headers = {} } end
+      if o.Url:find('/session', 1, true) then return { StatusCode = 201, Body = json.encode({ token = 't', expiresIn = 3600, origin = ORIGIN, errorCapture = { enabled = false, trail = false } }), Headers = {} } end
+      return { StatusCode = 202, Body = '{}', Headers = {} }
+    end })
+    assert(init(w, { captureErrors = true }))
+    w.ScriptContext.Error.fire('early', 'ServerScriptService.A:1')
+    w.tick(1)
+    eq(#w.ScriptContext.Error.fns, 0, 'disconnected')
+    w.tick(16)
+    for _, e in ipairs(w.events()) do assert(e.event ~= 'error', 'nothing captured or released') end
+  end },
+
+  { 'a huge error line is cut before any template work and still capped', function()
+    local w = world()
+    assert(init(w, { captureErrors = true }))
+    local huge = string.rep('x1 ', 400000)
+    for _ = 1, 5 do w.ScriptContext.Error.fire(huge, string.rep('frame\n', 50000)) end
+    w.tick(16)
+    local n = 0
+    for _, e in ipairs(w.events()) do
+      if e.event == 'error' then
+        n = n + 1
+        assert(#e.data.rs_message <= 200 and #(e.data.rs_stack or '') <= 2000)
+      end
+    end
+    eq(n, 3, 'three for one dedupe key')
+  end },
+
   { 'manual errors, typed events, ads and attribution for a player', function()
     local w = world()
     assert(init(w))

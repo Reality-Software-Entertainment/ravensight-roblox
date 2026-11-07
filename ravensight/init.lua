@@ -377,13 +377,17 @@ local function finishLeaving()
   end
 end
 
+local syncErrorHook
 local function step()
   if not initialized then return end
   sender.pump()
   for _, entry in pairs(players) do
     if entry.core then entry.core:update() end
   end
-  if serverEntry then serverEntry.core:update() end
+  if serverEntry then
+    serverEntry.core:update()
+    syncErrorHook()
+  end
   finishLeaving()
   local t = env().now()
   if t - lastSave >= M.SAVE_INTERVAL then
@@ -436,9 +440,21 @@ local function startErrorCapture()
   core:start()
   local ok, scriptContext = pcall(env().service, 'ScriptContext')
   if not ok or not scriptContext then return end
-  connections[#connections + 1] = scriptContext.Error:Connect(function(message, trace, source)
+  serverEntry.connection = scriptContext.Error:Connect(function(message, trace, source)
     M.captureScriptError(message, trace, source)
   end)
+end
+
+--- With the game's error capture switch off (the session or settings
+--- answer), the hook is taken out rather than left to drop every error.
+function syncErrorHook()
+  local entry = serverEntry
+  if not entry or not entry.connection then return end
+  local capture = entry.core.errorCapture
+  if capture and not capture.enabled then
+    pcall(function() entry.connection:Disconnect() end)
+    entry.connection = nil
+  end
 end
 
 --- Feeds one server script error to automatic capture. The SDK's own
@@ -685,6 +701,7 @@ end
 --- For the specs only: forget everything so init() can run again.
 function M._reset()
   for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+  if serverEntry and serverEntry.connection then pcall(function() serverEntry.connection:Disconnect() end) end
   config, initialized, players, serverEntry, listeners, sender, connections, lastSave, warned =
     nil, false, {}, nil, {}, nil, {}, 0, {}
 end

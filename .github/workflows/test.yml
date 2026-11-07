@@ -1,0 +1,33 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  specs:
+    name: Specs under LuaJIT and Lua 5.4
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq luajit lua5.4
+      - name: LuaJIT bit
+        run: luajit spec/run.lua
+      - name: Luau bit32 semantics under LuaJIT
+        run: luajit spec/run.lua bit32
+      - name: Luau bit32 semantics under Lua 5.4
+        run: lua5.4 spec/run.lua bit32
+
+  luau:
+    name: Every module compiles as Luau
+    runs-on: ubuntu-24.04
+    env:
+      LUAU_VERSION: '0.745'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the Luau compiler
+        run: |
+          curl -sfL -o luau.zip "https://github.com/luau-lang/luau/releases/download/${LUAU_VERSION}/luau-ubuntu.zip"
+          mkdir -p tools && unzip -q luau.zip -d tools && chmod +x tools/*
+      - name: Compile
+        run: for f in ravensight/*.lua example/*.lua; do tools/luau-compile --binary "$f" > /dev/null || exit 1; done

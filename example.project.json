@@ -1,0 +1,21 @@
+{
+  "name": "RavensightExample",
+  "tree": {
+    "$className": "DataModel",
+    "ServerScriptService": {
+      "Ravensight": { "$path": "ravensight" },
+      "RavensightExample": { "$path": "example/RavensightExample.server.lua" }
+    },
+    "ServerStorage": {
+      "RavensightSecrets": { "$path": "example/RavensightSecrets.lua" }
+    },
+    "ReplicatedStorage": {
+      "RavensightOptOut": { "$className": "RemoteEvent" }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "RavensightOptOutButton": { "$path": "example/RavensightOptOutButton.client.lua" }
+      }
+    }
+  }
+}

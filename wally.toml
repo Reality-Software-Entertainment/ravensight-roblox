@@ -1,0 +1,8 @@
+[package]
+name = "reality-software-entertainment/ravensight"
+version = "0.1.0"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "server"
+license = "MIT"
+description = "Ravensight player analytics for Roblox, from the game server."
+include = ["ravensight", "default.project.json", "README.md", "LICENSE"]

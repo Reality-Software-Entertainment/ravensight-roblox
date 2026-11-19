@@ -195,7 +195,7 @@ return {
     eq(w.requests[2].Url, 'https://api.test/api/v1/session')
     eq(session.deviceId, Ravensight.deviceIdFor(SALT, 42))
     eq(session.platform, 'roblox')
-    eq(session.sdk, 'roblox/0.1.0')
+    eq(session.sdk, 'roblox/0.2.0')
     eq(session.gameVersion, '7')
     eq(session.device, nil, 'a server knows no device fields')
     eq(w.requests[2].Headers['X-API-Key'], 'gt_live_k')

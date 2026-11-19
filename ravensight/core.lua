@@ -55,7 +55,7 @@ local Errors = import('errors')
 local Core = {}
 Core.__index = Core
 
-Core.VERSION = '0.1.0'
+Core.VERSION = '0.2.0'
 --- The SDK name sent on the session.
 Core.SDK_NAME = 'roblox'
 --- The API host when none is given.

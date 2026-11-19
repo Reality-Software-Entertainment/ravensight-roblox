@@ -37,12 +37,14 @@ a client reaches the SDK through the game's own RemoteEvents.
 | Remote config and exposure | Per player: `fetchConfig(player)`, `getConfig(player, key, fallback)`. | Possible: a read marks only that player's session as exposed. |
 | Ads | No mediation callbacks on Roblox. | `trackAd` and `trackAdRevenue` take what the game reports, per player. |
 | Attribution | `Player:GetJoinData().LaunchData`, the string an experience link carries. | Possible: `utm_source`, `utm_campaign`, `utm_term` and `utm_content` are read from it (query string or JSON) and nothing else, once per player. |
+| Campaign links | No page address reaches a server. A campaign link's redirect adds `rs_link` to the address itself, which Roblox does not pass into the game, so it can never land inside `LaunchData` by itself. | Degraded: the SDK reads `rs_link` from the launch data (query string or JSON) only when the studio put it there, by making the link's destination an experience link with `launchData=rs_link%3D<link id>`; otherwise the game passes it with `setCampaignLink(player, linkId)`. Reading it is no more trusting than the web SDK reading a page address: anyone can make such a link, and the server keeps the id only when it names a link of the same game. |
+| Identify | The player's DataStore entry; the session answer's identify salt. | Possible, with one deviation: the salted hash is saved in the player's entry and sent once per session, per player. The player's UserId, name and display name are refused (they are public). `resetIdentity` cannot give a lasting fresh device id, because the device id comes from the UserId (see item 10). |
 | Playtest command line | None. | Not supported. |
 | Packaging | Rojo project (`default.project.json`), or the files copied into Studio as ModuleScripts. | Possible. Modules load each other by instance on Roblox and by name in the specs. Nothing is published to any package registry or store; the source is the public repository and its tags. |
 
 ## Contract items degraded
 
-1. The device id is a salted hash of the UserId, not a random per-install id. It follows the account across devices, and there is no reset.
+1. The device id is a salted hash of the UserId, not a random per-install id. It follows the account across devices, and there is no reset beyond the one server visit item 10 describes.
 2. No device fields, and the platform is always `roblox`.
 3. The queue is saved at leave, at shutdown, every 120 seconds and on a privacy choice, not on every change. A server crash can lose up to 120 seconds.
 4. Bodies are never gzip compressed.
@@ -51,6 +53,8 @@ a client reaches the SDK through the game's own RemoteEvents.
 7. Error capture is off by default, server-only, under one server device, with no trail and no crash records.
 8. No playtest mode.
 9. Every request comes from the game server's address, so a country derived from the request address is the server's, not the player's, and the ingest per-address rate limit sees one address for every player in the server.
+10. `resetIdentity(player)` deletes the saved hash and switches the player to a fresh random device id, but only for the rest of that server visit (the id is kept in memory and never saved). The next visit is back on the id from the UserId, and its server-side link may still name the account the player signed out of until they sign in again. A Roblox account is one person's, so this credits a signed-out player's later anonymous play to their own last account, not to someone else's. The attribution flag is kept, since the next visit is the same device.
+11. Campaign links reach the game only through launch data the studio set up, or a `setCampaignLink` call.
 
 ## Privacy and platform rules (owner checks before listing)
 

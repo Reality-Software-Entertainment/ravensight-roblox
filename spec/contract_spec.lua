@@ -82,7 +82,7 @@ return {
   { 'the session names this SDK and version', function()
     local h = harness()
     local req = h.boot()
-    eq(json.decode(req.body).sdk, 'roblox/0.1.0')
+    eq(json.decode(req.body).sdk, 'roblox/0.2.0')
   end },
 
   -- ---------------------------------------------------------- lifecycle

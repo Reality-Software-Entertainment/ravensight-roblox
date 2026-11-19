@@ -48,8 +48,15 @@ run_checks() {
 # and whether the Luau compiler is on PATH. There is no lockfile: CI pins
 # Luau by version where it downloads it. A change forces the checks to run
 # again.
+# A missing tool prints a fixed line, never the shell's own message, which
+# names this file and a line number and so differs between invocations.
 deps_fingerprint() {
-  { luajit -v; lua5.4 -v; lua -v; command -v luau-compile || echo "no luau-compile"; } 2>&1 | git hash-object --stdin
+  {
+    for tool in luajit lua5.4 lua; do
+      if command -v "$tool" >/dev/null 2>&1; then "$tool" -v 2>&1; else echo "no $tool"; fi
+    done
+    command -v luau-compile || echo "no luau-compile"
+  } | git hash-object --stdin
 }
 
 # ---- shared by every repository's hook from here down ----

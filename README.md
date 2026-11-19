@@ -4,9 +4,11 @@ Player analytics for Roblox experiences: sessions, events, retention,
 levels, purchases, errors, remote config and experiments, sent to
 [Ravensight](https://ravensight.io) from your game server.
 
-Version 0.1.0. Beta: the specs pass under LuaJIT and Lua 5.4 with Luau's
-`bit32` semantics against fake engine services, but it has not yet run
-inside Roblox. See [docs/FEASIBILITY.md](docs/FEASIBILITY.md) for how a
+Preview: not yet verified inside Roblox; tested with the specs under LuaJIT
+and Lua 5.4 with Luau's `bit32` semantics against fake engine services, and
+every module compiles as Luau in CI.
+
+Version 0.1.0. See [docs/FEASIBILITY.md](docs/FEASIBILITY.md) for how a
 server-side SDK differs from the client SDKs.
 
 ## How it works
@@ -25,11 +27,15 @@ your own RemoteEvent, as any server logic would.
 
 ## Install
 
-With Rojo, sync `default.project.json` into `ServerScriptService` as a
-ModuleScript named `Ravensight`. With Wally, add
-`ravensight = "reality-software-entertainment/ravensight@0.1.0"` to
-`[server-dependencies]`. Or copy the `ravensight` folder into Studio as a
-ModuleScript with its other files as children.
+The source is the public repository
+[ravensight-roblox](https://github.com/Reality-Software-Entertainment/ravensight-roblox);
+use its `v0.2.0` tag. Nothing is published to any package registry or to
+the Creator Store. Clone or download the repository at that tag, then
+either sync `default.project.json` into `ServerScriptService` with Rojo,
+as a ModuleScript named `Ravensight`, or copy the `ravensight` folder into
+Studio by hand: `init.lua` becomes a ModuleScript named `Ravensight` and
+every other file a ModuleScript child of it, named after the file without
+`.lua`.
 
 Then:
 
@@ -175,6 +181,15 @@ luajit spec/run.lua           # LuaJIT's bit library
 luajit spec/run.lua bit32     # Luau's bit32 semantics, the Roblox path
 lua5.4 spec/run.lua bit32     # PUC Lua, stricter number handling
 ```
+
+CI also compiles every module as Luau, nightly and on demand
+(`.github/workflows/test.yml`).
+
+Install the local checks once per clone: `git config core.hooksPath .githooks`. The pre-push hook then runs this repository's tests before every push, with a time limit, and refuses the push if they fail. CI runs nightly and on demand, not on pushes or pull requests, so this hook is where a change is checked first.
+
+The hook runs the three passes above. Without Lua 5.4 it uses the `lua` on
+your path when that is 5.3 or later, and without either it runs the two
+LuaJIT passes only.
 
 ## License
 

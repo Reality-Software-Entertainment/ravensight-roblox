@@ -38,7 +38,7 @@ a client reaches the SDK through the game's own RemoteEvents.
 | Ads | No mediation callbacks on Roblox. | `trackAd` and `trackAdRevenue` take what the game reports, per player. |
 | Attribution | `Player:GetJoinData().LaunchData`, the string an experience link carries. | Possible: `utm_source`, `utm_campaign`, `utm_term` and `utm_content` are read from it (query string or JSON) and nothing else, once per player. |
 | Playtest command line | None. | Not supported. |
-| Packaging | Rojo project (`default.project.json`), a Wally package, or a model file saved from Studio. | Possible. Modules load each other by instance on Roblox and by name in the specs. |
+| Packaging | Rojo project (`default.project.json`), or the files copied into Studio as ModuleScripts. | Possible. Modules load each other by instance on Roblox and by name in the specs. Nothing is published to any package registry or store; the source is the public repository and its tags. |
 
 ## Contract items degraded
 

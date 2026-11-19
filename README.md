@@ -292,9 +292,11 @@ CI also compiles every module as Luau, nightly and on demand
 
 Install the local checks once per clone: `git config core.hooksPath .githooks`. The pre-push hook then runs this repository's tests before every push, with a time limit, and refuses the push if they fail. CI runs nightly and on demand, not on pushes or pull requests, so this hook is where a change is checked first.
 
-The hook runs the three passes above. Without Lua 5.4 it uses the `lua` on
-your path when that is 5.3 or later, and without either it runs the two
-LuaJIT passes only.
+The hook runs the three passes above, as CI does, and the Luau compile of
+every module when `luau-compile` is on your path; without it, it says the
+compile runs in CI only. Without Lua 5.4 it uses the `lua` on your path when
+that is 5.3 or later, and without either it refuses the push.
+`sh .githooks/test-pre-push.sh` tests the hook's refuse paths.
 
 ## License
 

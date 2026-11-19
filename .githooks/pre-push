@@ -1,33 +1,58 @@
 #!/bin/sh
 # Local gate. GitHub CI runs nightly and on demand only, never on a push or a
-# pull request, so this repository's checks run here before anything leaves
-# the machine, with a time limit, and a failure refuses the push.
+# pull request (the owner's decision), so this repository's checks run here
+# before anything leaves the machine, with a time limit, and a failure refuses
+# the push.
 #
 # Install once per clone: git config core.hooksPath .githooks
 #
-# A pushed commit is checked when it is HEAD and the tracked files are clean.
-# A tree that passed is remembered (in the shared git dir), so pushing the same
-# files again, to another remote or after a rebase, does not rerun the checks.
-# Branch deletions and pushes of an already checked tree pass straight through.
+# A pushed commit is checked only when it is HEAD and the work tree is exactly
+# HEAD: no staged, changed or untracked file (ignored files are fine). After
+# the checks pass, HEAD, the work tree and the toolchain are read again, and
+# nothing is stamped if any of them changed during the run. A tree that passed
+# with the same lockfile and toolchain is remembered under the git dir, so
+# pushing it again, to another remote or after a rebase, does not rerun the
+# checks. Branch deletions pass straight through.
+#
+# This is accident-proofing for a single-owner repository: it stops an
+# untested or half-edited tree from leaving by mistake. It is not a defence
+# against someone who can already write to the repository, who could edit
+# this file or the stamps. .githooks/test-pre-push.sh tests the refuse paths.
 
 LIMIT_SECONDS=600
 
+# ---- this repository's checks: the only part that differs between repos ----
+
+# PUC Lua for the third spec pass: Lua 5.4 as in CI, else the lua on PATH
+# when it is 5.3 or later (the spec bit32 shim needs the 5.3 operators).
+puc_lua() {
+  if command -v lua5.4 >/dev/null 2>&1; then command -v lua5.4; return 0; fi
+  case "$(lua -v 2>&1)" in "Lua 5."[3-9]*) command -v lua ;; esac
+}
+
 run_checks() {
   jit=$(command -v luajit) || { echo "pre-push: LuaJIT is needed for the spec suite (brew install luajit)." >&2; return 1; }
-  # PUC Lua runs the bit32 pass with stricter number handling: Lua 5.4 as in
-  # CI, else the lua on the path when it is 5.3 or later (the spec bit32 shim
-  # needs the 5.3 operators). Without one, that pass is skipped.
-  puc=$(command -v lua5.4 || true)
-  if [ -z "$puc" ] && command -v lua >/dev/null 2>&1; then
-    case "$(lua -v 2>&1)" in "Lua 5."[3-9]*) puc=$(command -v lua) ;; esac
-  fi
-  if [ -n "$puc" ]; then
-    with_limit sh -c "\"$jit\" spec/run.lua && \"$jit\" spec/run.lua bit32 && \"$puc\" spec/run.lua bit32"
+  puc=$(puc_lua)
+  [ -n "$puc" ] || { echo "pre-push: Lua 5.4 (or another lua 5.3 or later) is needed for the PUC Lua bit32 pass that CI runs (brew install lua)." >&2; return 1; }
+  with_limit "$jit" spec/run.lua || return 1
+  with_limit "$jit" spec/run.lua bit32 || return 1
+  with_limit "$puc" spec/run.lua bit32 || return 1
+  if command -v luau-compile >/dev/null 2>&1; then
+    with_limit sh -c 'for f in ravensight/*.lua example/*.lua; do luau-compile --binary "$f" > /dev/null || exit 1; done'
   else
-    echo "pre-push: no PUC Lua (lua5.4 or lua) found; running the LuaJIT passes only. CI runs Lua 5.4." >&2
-    with_limit sh -c "\"$jit\" spec/run.lua && \"$jit\" spec/run.lua bit32"
+    echo "pre-push: luau-compile is not on PATH, so the Luau compile of every module runs in CI only."
   fi
 }
+
+# Besides the tracked files, these decide the result: the toolchain versions
+# and whether the Luau compiler is on PATH. There is no lockfile: CI pins
+# Luau by version where it downloads it. A change forces the checks to run
+# again.
+deps_fingerprint() {
+  { luajit -v; lua5.4 -v; lua -v; command -v luau-compile || echo "no luau-compile"; } 2>&1 | git hash-object --stdin
+}
+
+# ---- shared by every repository's hook from here down ----
 
 # Node 24 is the version CI uses; prefer it when the default node differs.
 use_node24() {
@@ -60,27 +85,46 @@ with_limit() {
 
 root=$(git rev-parse --show-toplevel) || exit 1
 stamps="$(git rev-parse --git-common-dir)/prepush-passed"
+case "$stamps" in /*) ;; *) stamps="$PWD/$stamps" ;; esac
 zero=0000000000000000000000000000000000000000
-head_tree=$(git rev-parse "HEAD^{tree}" 2>/dev/null)
+
+# git exports GIT_DIR and friends to hooks; a test that builds a sandbox repo
+# would inherit them and act on this repository instead, so the checks (and
+# the fingerprint) run without them, from the top of the work tree.
+clean_env() {
+  (unset $(git rev-parse --local-env-vars); cd "$root" && "$@")
+}
+
+# The tree of HEAD when the work tree is exactly HEAD, else nothing.
+clean_head_tree() {
+  [ -z "$(git -C "$root" status --porcelain --untracked-files=all 2>/dev/null)" ] || return 0
+  git -C "$root" rev-parse "HEAD^{tree}" 2>/dev/null
+}
+
+fp=$(clean_env deps_fingerprint </dev/null)
 checked=""
 status=0
 
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "$zero" ] && continue
   tree=$(git rev-parse "$local_sha^{tree}" 2>/dev/null) || continue
-  [ -f "$stamps/$tree" ] && continue
-  [ "$tree" = "$checked" ] && continue
-  if [ "$tree" != "$head_tree" ] || ! git -C "$root" diff --quiet HEAD --; then
-    echo "pre-push: $(echo "$local_sha" | cut -c1-8) has not passed the checks. Check it out with a clean tree and push again." >&2
+  key="$tree.$fp"
+  [ -f "$stamps/$key" ] && continue
+  [ "$key" = "$checked" ] && continue
+  if [ "$(clean_head_tree)" != "$tree" ]; then
+    echo "pre-push: $(echo "$local_sha" | cut -c1-8) has not passed the checks. Check it out as HEAD with no changed or untracked files and push again." >&2
     status=1
     continue
   fi
   echo "pre-push: running this repository's checks (limit ${LIMIT_SECONDS}s)."
-  # git exports GIT_DIR and friends to hooks; a test that builds a sandbox repo would inherit
-  # them and act on this repository instead, so the checks run without them.
-  if (unset $(git rev-parse --local-env-vars); cd "$root" && run_checks) </dev/null; then
-    mkdir -p "$stamps" && date -u +%Y-%m-%dT%H:%M:%SZ > "$stamps/$tree"
-    checked=$tree
+  if clean_env run_checks </dev/null; then
+    if [ "$(clean_head_tree)" != "$tree" ] || [ "$(clean_env deps_fingerprint </dev/null)" != "$fp" ]; then
+      echo "pre-push: HEAD, a file or the toolchain changed while the checks ran, so this run proves nothing; the push is refused. Push again." >&2
+      status=1
+      continue
+    fi
+    mkdir -p "$stamps" && date -u +%Y-%m-%dT%H:%M:%SZ > "$stamps/$key"
+    checked=$key
   else
     echo "pre-push: checks failed; the push is refused. Fix them and push again." >&2
     status=1

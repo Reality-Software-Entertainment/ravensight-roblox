@@ -44,6 +44,7 @@ M.PLATFORM = 'roblox'
 local config = nil
 local initialized = false
 local players = {}     -- Player -> entry {core, store, leaving}
+local pending = {}     -- Player -> {account, reset, link} set before their core exists
 local serverEntry = nil -- the error capture device, when captureErrors is on
 local listeners = {}
 local sender = nil
@@ -180,20 +181,25 @@ end
 -- ----------------------------------------------------------------- storage
 
 --- One player's saved state in a DataStore entry keyed by the device id
---- (never the UserId): the opt-out or opt-in choice, the attribution flag
---- and the unsent queue. Read once when the player joins; written when the
---- player leaves, when the server shuts down, every SAVE_INTERVAL seconds
---- while changed, and at once for a privacy choice. The device id itself is
---- never stored: it is recomputed from the salt.
+--- (never the UserId): the opt-out or opt-in choice, the attribution flag,
+--- the unsent queue and identify's salted hash. Read once when the player
+--- joins; written when the player leaves, when the server shuts down, every
+--- SAVE_INTERVAL seconds while changed, and at once for a privacy choice or
+--- an identify call. The device id itself is never stored: it is recomputed
+--- from the salt. A device id the core resets (resetIdentity) lasts for the
+--- rest of this server visit only, in memory.
 local function newStore(deviceId, persist)
-  local store = { files = {}, dirty = false, persist = persist, key = 'rs1_' .. deviceId }
+  local store = { files = {}, dirty = false, persist = persist, key = 'rs1_' .. deviceId, visitDeviceId = nil }
 
   function store.read(name)
-    if name == Core.DEVICE_ID_FILE then return deviceId end
+    if name == Core.DEVICE_ID_FILE then return store.visitDeviceId or deviceId end
     return store.files[name]
   end
   function store.write(name, text)
-    if name == Core.DEVICE_ID_FILE then return end
+    if name == Core.DEVICE_ID_FILE then
+      if text ~= deviceId then store.visitDeviceId = text end
+      return
+    end
     if store.files[name] ~= text then
       store.files[name] = text
       store.dirty = true
@@ -201,7 +207,10 @@ local function newStore(deviceId, persist)
   end
   store.replace = store.write
   function store.remove(name)
-    if name == Core.DEVICE_ID_FILE then return end
+    if name == Core.DEVICE_ID_FILE then
+      store.visitDeviceId = nil
+      return
+    end
     if store.files[name] ~= nil then
       store.files[name] = nil
       store.dirty = true
@@ -297,6 +306,11 @@ local function forward(core, player)
   end
 end
 
+--- One query string value, decoded: "+" is a space, %XX a byte.
+local function queryValue(v)
+  return (v:gsub('%+', ' '):gsub('%%(%x%x)', function(h) return string.char(tonumber(h, 16)) end))
+end
+
 --- Reads utm_source, utm_campaign, utm_term and utm_content from a join's
 --- launch data (a query string or a JSON object), and nothing else. Nil
 --- when none is present.
@@ -312,7 +326,7 @@ function M.attributionFromLaunchData(launchData)
     for pair in launchData:gsub('^%?', ''):gmatch('[^&]+') do
       local k, v = pair:match('^([^=]+)=(.*)$')
       if k == 'utm_source' or k == 'utm_campaign' or k == 'utm_term' or k == 'utm_content' then
-        fields[k] = (v:gsub('%+', ' '):gsub('%%(%x%x)', function(h) return string.char(tonumber(h, 16)) end))
+        fields[k] = queryValue(v)
       end
     end
   end
@@ -331,6 +345,37 @@ function M.attributionFromLaunchData(launchData)
   return out
 end
 
+--- The campaign link id in a join's launch data: `rs_link` in a query
+--- string (the first one, decoded) or in a JSON object, lowercased when it
+--- is a link id (24 hex characters), else nil. Nothing else is read. A
+--- campaign link's redirect cannot put it there by itself: the studio puts
+--- it in the experience link's launch data (see the README).
+function M.campaignLinkFromLaunchData(launchData)
+  if type(launchData) ~= 'string' or launchData == '' or #launchData > 2000 then return nil end
+  local value
+  local parsed = json.decode(launchData)
+  if type(parsed) == 'table' then
+    value = parsed.rs_link
+  else
+    for pair in launchData:gsub('^%?', ''):gmatch('[^&]+') do
+      local k, v = pair:match('^([^=]+)=(.*)$')
+      if k == 'rs_link' and value == nil then value = queryValue(v) end
+    end
+  end
+  return Core.campaignLinkId(value)
+end
+
+--- Runs fn(core) and keeps the player's attribution flag. A reset device id
+--- lasts only for this server visit (the id comes back from the UserId on
+--- the next one), and that device already sent its attribution.
+local function keepingAttribution(entry, fn)
+  local flag = entry.store.files[Core.ATTRIBUTION_FILE]
+  local a, b = fn(entry.core)
+  if flag and entry.store.files[Core.ATTRIBUTION_FILE] == nil then entry.store.write(Core.ATTRIBUTION_FILE, flag) end
+  return a, b
+end
+
+
 local function addPlayer(player)
   if not initialized or players[player] then return end
   local deviceId = M.deviceIdFor(config.salt, player.UserId)
@@ -344,19 +389,35 @@ local function addPlayer(player)
   local core = newCore(deviceId, store)
   entry.core = core
   forward(core, player)
-  core:start()
+  local launchData = nil
   if config.attributionFromLaunchData and player.GetJoinData then
     local ok, joinData = pcall(player.GetJoinData, player)
-    local attribution = ok and type(joinData) == 'table' and M.attributionFromLaunchData(joinData.LaunchData)
-    if attribution then
-      attribution.touchTime = entry.joinedAt
-      core:setAttribution(attribution)
-    end
+    if ok and type(joinData) == 'table' then launchData = joinData.LaunchData end
   end
+  -- A campaign link goes with the player's first session: the one in the
+  -- launch data, replaced by one the game set before the state loaded.
+  local waiting = pending[player]
+  pending[player] = nil
+  local launchLink = M.campaignLinkFromLaunchData(launchData)
+  if launchLink then core:setCampaignLink(launchLink) end
+  if waiting and waiting.link then core:setCampaignLink(waiting.link) end
+  -- A sign-out the game asked for before the state loaded happens before
+  -- the first session, so a saved identity is never sent; an identify
+  -- waits for the start, which reads the saved one to compare with.
+  if waiting and waiting.reset then keepingAttribution(entry, function(c) c:resetIdentity() end) end
+  core:start()
+  local attribution = M.attributionFromLaunchData(launchData)
+  if attribution then
+    attribution.touchTime = entry.joinedAt
+    core:setAttribution(attribution)
+  end
+  if waiting and waiting.account then keepingAttribution(entry, function(c) return c:identify(waiting.account) end) end
+  if waiting and (waiting.reset or waiting.account) then env().spawn(store.commit) end
   if entry.leaving then core:beginQuit() end
 end
 
 local function removePlayer(player)
+  pending[player] = nil
   local entry = players[player]
   if not entry or entry.leaving then return end
   entry.leaving = true
@@ -667,6 +728,123 @@ function M.forgetPlayer(userId)
   return removed
 end
 
+-- ------------------------------------------- identify players who sign in
+
+--- True when `id` is the player's UserId, name or display name: public, and
+--- tied to their Roblox account, so never an account id to hash.
+local function isRobloxIdentity(player, id)
+  if type(player) ~= 'table' and type(player) ~= 'userdata' then return false end
+  local ok, same = pcall(function()
+    return id == tostring(player.UserId) or id == player.Name or id == player.DisplayName
+  end)
+  return ok and same == true
+end
+
+--- Links this player to your game's OWN account system, after your own
+--- sign-in. A Roblox player is already one id across every device they play
+--- on, so a game without its own accounts never needs this. Pass a random,
+--- high-entropy id stored with the account (a random UUID or analytics id),
+--- a string or a whole number used as its decimal digits; never the UserId,
+--- a name, a handle, a sequential database key or an email: they are public
+--- or guessable, and Ravensight's identify salt for your game reaches every
+--- key of the game, so a guessable id can be matched. The hash is a
+--- pseudonymous identifier to declare in the game's privacy notice.
+---
+--- Only a salted hash (accountHash, HMAC-SHA256 keyed with Ravensight's
+--- identify salt from the session answer, not your device id salt) is sent,
+--- with the player's session token, once per session, and saved in the
+--- player's DataStore entry. The id itself is held in memory only until
+--- that salt is known. A different account first does resetIdentity. It
+--- never enters the event queue or delays an event. Before the player's
+--- opt_in yes it is held in memory only. A call before the player's saved
+--- state has loaded is held and applied when it has.
+---
+--- Returns true, or false and the reason: "not_text", "empty", "too_long"
+--- (over 256 bytes of UTF-8), "looks_like_email" (any "@"),
+--- "looks_like_user_id" (the player's UserId, name or display name),
+--- "no_player" or "not_started" (before init, or inert). A refusal changes
+--- nothing and prints one warning.
+function M.identify(player, accountId)
+  local id, reason = Core.identifyRefusal(accountId)
+  if not id then
+    log('warn', 'identify() refused (' .. reason .. '): pass a non-empty random id of at most 256 bytes with no @')
+    return false, reason
+  end
+  if not initialized then return false, 'not_started' end
+  if player == nil then return false, 'no_player' end
+  if isRobloxIdentity(player, id) then
+    log('warn', 'identify() refused (looks_like_user_id): pass a random id your game stores with its own account, never the UserId or a name')
+    return false, 'looks_like_user_id'
+  end
+  local entry = players[player]
+  if entry and entry.core then
+    local ok, why = keepingAttribution(entry, function(core) return core:identify(id) end)
+    env().spawn(entry.store.commit)
+    return ok, why
+  end
+  local waiting = pending[player] or {}
+  waiting.account = id
+  pending[player] = waiting
+  return true
+end
+
+--- For sign-out from your game's own account: forgets it and deletes the
+--- saved hash from the player's entry at once. Sends nothing; does nothing
+--- when no account is set. Roblox derives the device id from the UserId, so
+--- the fresh device id the other SDKs switch to lasts only for the rest of
+--- this server visit; on the next visit the player is back on the id from
+--- their UserId, which may still count as the account they signed out of
+--- until they sign in again (see docs/FEASIBILITY.md).
+function M.resetIdentity(player)
+  if player == nil or not initialized then return end
+  local entry = players[player]
+  if entry and entry.core then
+    keepingAttribution(entry, function(core) core:resetIdentity() end)
+    env().spawn(entry.store.commit)
+    return
+  end
+  local waiting = pending[player] or {}
+  waiting.account = nil
+  waiting.reset = true
+  pending[player] = waiting
+end
+
+--- True while an account is set by identify for this player. The id is
+--- never readable.
+function M.isIdentified(player)
+  local entry = player and players[player]
+  if entry and entry.core then return entry.core:isIdentified() end
+  local waiting = player and pending[player]
+  return waiting ~= nil and waiting.account ~= nil
+end
+
+-- ---------------------------------------------------------- campaign links
+
+--- Sends a Ravensight campaign link with this player's next session, so the
+--- player is counted on the Campaign links page. The SDK already reads
+--- rs_link from the join's launch data (with attributionFromLaunchData,
+--- the default); call this when your game carries the link another way.
+--- A call before the player's state has loaded goes with their first
+--- session.
+---
+--- Returns true when `linkId` is a link id (24 hex characters, in any case),
+--- which then replaces any link waiting; otherwise false and the reason:
+--- "invalid_link", "no_player" or "not_started". A refusal changes nothing.
+--- Memory only; sent once, and only when the player's session may open
+--- (the player's consent).
+function M.setCampaignLink(player, linkId)
+  local id = Core.campaignLinkId(linkId)
+  if not id then return false, 'invalid_link' end
+  if not initialized then return false, 'not_started' end
+  if player == nil then return false, 'no_player' end
+  local entry = players[player]
+  if entry and entry.core then return entry.core:setCampaignLink(id) end
+  local waiting = pending[player] or {}
+  waiting.link = id
+  pending[player] = waiting
+  return true
+end
+
 function M.getDeviceId(player)
   local core = coreFor(player)
   return core and core.deviceId or nil
@@ -704,6 +882,7 @@ function M._reset()
   if serverEntry and serverEntry.connection then pcall(function() serverEntry.connection:Disconnect() end) end
   config, initialized, players, serverEntry, listeners, sender, connections, lastSave, warned =
     nil, false, {}, nil, {}, nil, {}, 0, {}
+  pending = {}
 end
 function M._players() return players end
 function M._server() return serverEntry end

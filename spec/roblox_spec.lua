@@ -641,7 +641,8 @@ return {
     w2.join(p2)
     eq(#requestsTo(w2, '/api/v1/identify'), 0, 'the signed-out hash is never sent')
     eq(Ravensight.isIdentified(p2), false)
-    eq(entryOf(w2, 13)[Core.IDENTITY_FILE], nil)
+    local entry = entryOf(w2, 13)
+    eq(entry and entry[Core.IDENTITY_FILE], nil, 'deleted from the entry')
     assert(Ravensight.getDeviceId(p2) ~= Ravensight.deviceIdFor(SALT, 13), 'a fresh id for this visit')
   end },
 

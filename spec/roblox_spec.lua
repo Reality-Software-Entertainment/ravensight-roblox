@@ -3,6 +3,7 @@
 local Ravensight = require('ravensight')
 local Core = require('ravensight.core')
 local json = require('ravensight.json')
+local Hmac = require('ravensight.hmac')
 
 local function eq(a, b, msg) assert(a == b, (msg or '') .. ' expected ' .. tostring(b) .. ', got ' .. tostring(a)) end
 
@@ -109,6 +110,50 @@ local function names(events)
   local out = {}
   for _, e in ipairs(events) do out[#out + 1] = e.event end
   return table.concat(out, ',')
+end
+
+-- 0.2.0: Ravensight's identify salt for the game (the vectors' test salt;
+-- not the device id salt above), and two campaign link ids.
+local IDENTIFY_SALT = 'a3f1c9e07b2d48c6915e2f7a0d4b8c3e6f1a9d2c7e5b0f4a8d3c6e9b1f2a7d40'
+local LINK = '64b0000000000000000000a1'
+local LINK2 = '64b0000000000000000000b2'
+
+--- A server that offers identify: sessions tok1, tok2, ... carry the
+--- identify salt, and POST /api/v1/identify answers 200.
+local function identifyResponder()
+  local sessions = 0
+  return function(o)
+    if o.Url:find('/api/v1/settings', 1, true) then return { StatusCode = 200, Body = json.encode({ trackingEnabled = true }), Headers = {} } end
+    if o.Url:find('/api/v1/session', 1, true) then
+      sessions = sessions + 1
+      return { StatusCode = 201, Body = json.encode({ token = 'tok' .. sessions, expiresIn = 3600, origin = ORIGIN, identify = { salt = IDENTIFY_SALT } }), Headers = {} }
+    end
+    if o.Url:find('/api/v1/identify', 1, true) then return { StatusCode = 200, Body = json.encode({ playerId = 'px_x', linked = true, verified = false }), Headers = {} } end
+    if o.Url:find('/api/v1/track/batch', 1, true) then
+      local n = #json.decode(o.Body).events
+      return { StatusCode = 202, Body = json.encode({ accepted = n }), Headers = {} }
+    end
+    return { StatusCode = 404, Body = '{}', Headers = {} }
+  end
+end
+
+--- Every request sent to `path`, oldest first.
+local function requestsTo(w, path)
+  local out = {}
+  for _, r in ipairs(w.requests) do if r.Url:find(path, 1, true) then out[#out + 1] = r end end
+  return out
+end
+
+--- The body of every POST /api/v1/session, oldest first.
+local function sessionBodies(w)
+  local out = {}
+  for _, r in ipairs(requestsTo(w, '/api/v1/session')) do out[#out + 1] = json.decode(r.Body) end
+  return out
+end
+
+--- The player's saved DataStore entry.
+local function entryOf(w, userId)
+  return w.saved['rs1_' .. Ravensight.deviceIdFor(SALT, userId)]
 end
 
 local function init(w, extra)
@@ -424,5 +469,281 @@ return {
     off()
     w.join(w.player(32))
     eq(table.concat(got, ','), '31')
+  end },
+
+  -- ------------------------------------------------------- 0.2.0: identify
+
+  { 'identify: hashed with the identify salt from the session answer, sent once on the player session, saved in their entry at once', function()
+    local w = world({ responder = identifyResponder() })
+    assert(init(w))
+    local p = w.join(w.player(42))
+    local account = '3f2a9c1e-7b4d-4e8a-9c3f-1a2b3c4d5e6f'
+    eq(Ravensight.identify(p, account), true)
+    eq(Ravensight.isIdentified(p), true)
+    eq(Ravensight.identify(p, account), true, 'the same account again')
+    local sent = requestsTo(w, '/api/v1/identify')
+    eq(#sent, 1, 'once for the session')
+    eq(sent[1].Method, 'POST')
+    eq(sent[1].Headers['X-API-Key'], 'gt_live_k')
+    eq(sent[1].Headers['X-Session-Token'], 'tok1')
+    eq(sent[1].Body, '{"accountHash":"' .. Hmac.hex(IDENTIFY_SALT, account) .. '"}')
+    local entry = entryOf(w, 42)
+    assert(entry and entry[Core.IDENTITY_FILE], 'saved in the player entry at once')
+    local stored = json.decode(entry[Core.IDENTITY_FILE])
+    eq(stored.salt, IDENTIFY_SALT)
+    eq(stored.accountHash, Hmac.hex(IDENTIFY_SALT, account))
+    for name, text in pairs(entry) do assert(not text:find(account, 1, true), 'never the raw id: ' .. name) end
+    eq(w.saved['rs1_42'], nil, 'never keyed by the UserId')
+  end },
+
+  { 'identify: the next server identifies the player again from the saved entry, with no call', function()
+    local w = world({ responder = identifyResponder() })
+    assert(init(w))
+    local p = w.join(w.player(42))
+    Ravensight.identify(p, 'acct-7d41c0a2')
+    w.leave(p)
+    w.tick(1)
+    local w2 = world({ saved = w.saved, responder = identifyResponder() })
+    assert(init(w2))
+    local p2 = w2.join(w2.player(42))
+    eq(Ravensight.isIdentified(p2), true)
+    local sent = requestsTo(w2, '/api/v1/identify')
+    eq(#sent, 1)
+    eq(sent[1].Body, '{"accountHash":"' .. Hmac.hex(IDENTIFY_SALT, 'acct-7d41c0a2') .. '"}')
+  end },
+
+  { 'identify: refusals give the reason and one warning that never prints the value; the UserId or a name is refused', function()
+    local w = world({ responder = identifyResponder() })
+    local ok, reason = Ravensight.identify(w.player(1), 'u1')
+    eq(ok, false); eq(reason, 'not_started')
+    assert(init(w))
+    local p = w.join(w.player(77))
+    p.DisplayName = 'Shown Name'
+    local before = #w.warns
+    ok, reason = Ravensight.identify(p, 'a@secret.example')
+    eq(ok, false); eq(reason, 'looks_like_email')
+    eq(#w.warns, before + 1, 'one warning')
+    assert(w.warns[#w.warns]:find('identify', 1, true))
+    assert(not w.warns[#w.warns]:find('secret', 1, true), 'the value is never printed')
+    for _, value in ipairs({ 77, '77', 'p77', 'Shown Name' }) do
+      before = #w.warns
+      ok, reason = Ravensight.identify(p, value)
+      eq(ok, false, tostring(value)); eq(reason, 'looks_like_user_id', tostring(value))
+      eq(#w.warns, before + 1, 'one warning')
+      assert(not w.warns[#w.warns]:find(tostring(value), 1, true), 'the value is never printed')
+    end
+    ok, reason = Ravensight.identify(p, 12.5)
+    eq(ok, false); eq(reason, 'not_text')
+    ok, reason = Ravensight.identify(nil, 'u1')
+    eq(ok, false); eq(reason, 'no_player')
+    eq(#requestsTo(w, '/api/v1/identify'), 0)
+    eq(Ravensight.isIdentified(p), false)
+    local entry = entryOf(w, 77)
+    eq(entry and entry[Core.IDENTITY_FILE], nil)
+  end },
+
+  { 'resetIdentity: the saved hash goes at once, the rest of the visit is on a fresh random id, the next visit is back on the UserId id', function()
+    local w = world({ responder = identifyResponder() })
+    assert(init(w))
+    local p = w.join(w.player(8, { LaunchData = 'utm_campaign=spring' }))
+    Ravensight.identify(p, 'acct-8f3a0c9d')
+    w.tick(16)
+    local base = Ravensight.deviceIdFor(SALT, 8)
+    eq(Ravensight.getDeviceId(p), base)
+    local identifies = #requestsTo(w, '/api/v1/identify')
+    eq(identifies, 1)
+    Ravensight.resetIdentity(p)
+    eq(Ravensight.isIdentified(p), false)
+    local entry = entryOf(w, 8)
+    eq(entry[Core.IDENTITY_FILE], nil, 'deleted from the entry at once')
+    assert(entry[Core.ATTRIBUTION_FILE], 'the attribution flag stays: the next visit is the same UserId device')
+    local fresh = Ravensight.getDeviceId(p)
+    assert(fresh ~= base and Core.is_random_device_id(fresh), 'a fresh random id: ' .. tostring(fresh))
+    Ravensight.track(p, 'after_sign_out', {})
+    w.tick(16)
+    local bodies = sessionBodies(w)
+    eq(bodies[#bodies].deviceId, fresh, 'the next session is on the fresh id')
+    eq(#requestsTo(w, '/api/v1/identify'), identifies, 'nothing sent')
+    Ravensight.resetIdentity(p)
+    eq(Ravensight.getDeviceId(p), fresh, 'again with nothing set: kept')
+    w.leave(p)
+    w.tick(1)
+
+    local w2 = world({ saved = w.saved, responder = identifyResponder() })
+    assert(init(w2))
+    local p2 = w2.join(w2.player(8, { LaunchData = 'utm_campaign=spring' }))
+    w2.tick(16)
+    eq(Ravensight.getDeviceId(p2), base, 'the next visit is on the UserId id again')
+    eq(sessionBodies(w2)[1].deviceId, base)
+    eq(#requestsTo(w2, '/api/v1/identify'), 0, 'not identified')
+    eq(Ravensight.isIdentified(p2), false)
+    for _, e in ipairs(w2.events()) do assert(e.event ~= 'rs_attribution', 'attribution is not sent twice') end
+  end },
+
+  { 'identify: a different account resets first, on a fresh random id for the rest of the visit', function()
+    local w = world({ responder = identifyResponder() })
+    assert(init(w))
+    local p = w.join(w.player(14))
+    Ravensight.identify(p, 'acct-one-51c2')
+    local base = Ravensight.getDeviceId(p)
+    Ravensight.identify(p, 'acct-two-93e7')
+    local sent = requestsTo(w, '/api/v1/identify')
+    eq(#sent, 2)
+    eq(sent[2].Body, '{"accountHash":"' .. Hmac.hex(IDENTIFY_SALT, 'acct-two-93e7') .. '"}')
+    eq(sent[2].Headers['X-Session-Token'], 'tok2', 'on a new session')
+    assert(Ravensight.getDeviceId(p) ~= base)
+    eq(json.decode(entryOf(w, 14)[Core.IDENTITY_FILE]).accountHash, Hmac.hex(IDENTIFY_SALT, 'acct-two-93e7'))
+  end },
+
+  { 'identify, resetIdentity and setCampaignLink before the player state loads are held and applied at join', function()
+    local w = world({ responder = identifyResponder() })
+    assert(init(w))
+    local p = w.player(9)
+    eq(Ravensight.identify(p, 'acct-held-1'), true)
+    eq(Ravensight.isIdentified(p), true)
+    eq(Ravensight.setCampaignLink(p, LINK:upper()), true)
+    w.join(p)
+    eq(sessionBodies(w)[1].campaignLink, LINK)
+    local sent = requestsTo(w, '/api/v1/identify')
+    eq(#sent, 1)
+    eq(sent[1].Body, '{"accountHash":"' .. Hmac.hex(IDENTIFY_SALT, 'acct-held-1') .. '"}')
+
+    -- Held, then the player left before joining: forgotten.
+    local q = w.player(10)
+    Ravensight.identify(q, 'acct-held-2')
+    Ravensight.setCampaignLink(q, LINK2)
+    w.leave(q)
+    eq(Ravensight.isIdentified(q), false)
+    w.join(q)
+    eq(#requestsTo(w, '/api/v1/identify'), 1, 'nothing held for a player who left')
+    for _, b in ipairs(sessionBodies(w)) do assert(b.campaignLink ~= LINK2) end
+
+    -- identify then resetIdentity before the join: nothing is identified.
+    local r = w.player(11)
+    Ravensight.identify(r, 'acct-held-3')
+    Ravensight.resetIdentity(r)
+    eq(Ravensight.isIdentified(r), false)
+    w.join(r)
+    eq(#requestsTo(w, '/api/v1/identify'), 1)
+  end },
+
+  { 'resetIdentity before the player state loads signs out a saved identity', function()
+    local w = world({ responder = identifyResponder() })
+    assert(init(w))
+    local p = w.join(w.player(13))
+    Ravensight.identify(p, 'acct-saved-13')
+    w.leave(p)
+    w.tick(1)
+    local w2 = world({ saved = w.saved, responder = identifyResponder() })
+    assert(init(w2))
+    local p2 = w2.player(13)
+    Ravensight.resetIdentity(p2)
+    w2.join(p2)
+    eq(#requestsTo(w2, '/api/v1/identify'), 0, 'the signed-out hash is never sent')
+    eq(Ravensight.isIdentified(p2), false)
+    eq(entryOf(w2, 13)[Core.IDENTITY_FILE], nil)
+    assert(Ravensight.getDeviceId(p2) ~= Ravensight.deviceIdFor(SALT, 13), 'a fresh id for this visit')
+  end },
+
+  { 'opt-out deletes the saved identity at once', function()
+    local w = world({ responder = identifyResponder() })
+    assert(init(w))
+    local p = w.join(w.player(12))
+    Ravensight.identify(p, 'acct-12-c4d1')
+    assert(entryOf(w, 12)[Core.IDENTITY_FILE])
+    Ravensight.setTrackingEnabled(p, false)
+    eq(entryOf(w, 12)[Core.IDENTITY_FILE], nil)
+    eq(Ravensight.isIdentified(p), false)
+  end },
+
+  { 'a server without identify: nothing is sent or saved', function()
+    local w = world()
+    assert(init(w))
+    local p = w.join(w.player(15))
+    eq(Ravensight.identify(p, 'acct-15-0a9b'), true)
+    w.tick(16)
+    eq(#requestsTo(w, '/api/v1/identify'), 0)
+    local entry = entryOf(w, 15)
+    eq(entry and entry[Core.IDENTITY_FILE], nil)
+  end },
+
+  -- ------------------------------------------------- 0.2.0: campaign links
+
+  { 'campaign link from launch data: a query string or JSON, lowercased, never trimmed, nothing else read', function()
+    eq(Ravensight.campaignLinkFromLaunchData('rs_link=' .. LINK:upper() .. '&utm_campaign=spring'), LINK)
+    eq(Ravensight.campaignLinkFromLaunchData('?rs_link=' .. LINK), LINK)
+    eq(Ravensight.campaignLinkFromLaunchData('rs_link=%36%34b0000000000000000000a1'), LINK, 'percent-decoded')
+    eq(Ravensight.campaignLinkFromLaunchData('{"rs_link":"' .. LINK .. '","level":3}'), LINK)
+    eq(Ravensight.campaignLinkFromLaunchData('rs_link=' .. LINK .. '&rs_link=' .. LINK2), LINK, 'the first one')
+    eq(Ravensight.campaignLinkFromLaunchData('rs_link=nope'), nil)
+    eq(Ravensight.campaignLinkFromLaunchData('rs_link=+' .. LINK), nil, 'never trimmed')
+    eq(Ravensight.campaignLinkFromLaunchData('{"rs_link":12}'), nil)
+    eq(Ravensight.campaignLinkFromLaunchData('level=3'), nil)
+    eq(Ravensight.campaignLinkFromLaunchData(''), nil)
+    eq(Ravensight.campaignLinkFromLaunchData(nil), nil)
+    eq(Ravensight.campaignLinkFromLaunchData('rs_link=' .. LINK .. '&pad=' .. string.rep('a', 2000)), nil, 'over 2,000 characters')
+  end },
+
+  { 'campaign link from launch data goes with the player first session only, beside the utm attribution', function()
+    local w = world()
+    assert(init(w))
+    local p = w.join(w.player(8, { LaunchData = 'rs_link=' .. LINK:upper() .. '&utm_campaign=spring' }))
+    w.tick(16)
+    eq(sessionBodies(w)[1].campaignLink, LINK)
+    eq(names(w.events()), 'game_started,rs_attribution')
+    w.wall = w.wall + 4000
+    Ravensight.track(p, 'later', {})
+    local bodies = sessionBodies(w)
+    eq(#bodies, 2)
+    eq(bodies[2].campaignLink, nil, 'the next session carries none')
+    w.leave(p)
+    w.tick(1)
+    for _, entry in pairs(w.saved) do
+      for name, text in pairs(entry) do assert(not text:find(LINK, 1, true), 'never saved: ' .. name) end
+    end
+
+    local w2 = world()
+    assert(init(w2, { attributionFromLaunchData = false }))
+    w2.join(w2.player(8, { LaunchData = 'rs_link=' .. LINK }))
+    eq(sessionBodies(w2)[1].campaignLink, nil, 'off with attributionFromLaunchData = false')
+
+    local w3 = world()
+    assert(init(w3))
+    local p3 = w3.player(8, { LaunchData = 'rs_link=' .. LINK })
+    eq(Ravensight.setCampaignLink(p3, LINK2), true)
+    w3.join(p3)
+    eq(sessionBodies(w3)[1].campaignLink, LINK2, 'a link the game set replaces the launch data one')
+  end },
+
+  { 'setCampaignLink after the join goes with the player next session; refusals change nothing', function()
+    local w = world()
+    local ok, reason = Ravensight.setCampaignLink(w.player(1), LINK)
+    eq(ok, false); eq(reason, 'not_started')
+    assert(init(w))
+    local p = w.join(w.player(5))
+    ok, reason = Ravensight.setCampaignLink(p, 'nope')
+    eq(ok, false); eq(reason, 'invalid_link')
+    ok, reason = Ravensight.setCampaignLink(nil, LINK)
+    eq(ok, false); eq(reason, 'no_player')
+    eq(Ravensight.setCampaignLink(p, LINK), true)
+    eq(Ravensight.setCampaignLink(p, 'zz'), false, 'keeps the link already set')
+    w.wall = w.wall + 4000
+    Ravensight.track(p, 'x', {})
+    local bodies = sessionBodies(w)
+    eq(bodies[1].campaignLink, nil)
+    eq(bodies[2].campaignLink, LINK)
+  end },
+
+  { 'opt_in: no link and no identify before the player says yes', function()
+    local w = world({ responder = identifyResponder() })
+    assert(init(w, { consent = 'opt_in' }))
+    local p = w.join(w.player(4, { LaunchData = 'rs_link=' .. LINK }))
+    Ravensight.identify(p, 'acct-4-77e0')
+    w.tick(20)
+    eq(#w.requests, 0)
+    eq(entryOf(w, 4), nil, 'nothing saved before the yes')
+    Ravensight.setTrackingEnabled(p, true)
+    eq(sessionBodies(w)[1].campaignLink, LINK, 'with the first session after the yes')
+    eq(#requestsTo(w, '/api/v1/identify'), 1)
   end },
 }

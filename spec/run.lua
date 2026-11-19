@@ -14,7 +14,7 @@ end
 local files = {
   'spec/json_spec.lua', 'spec/scrub_spec.lua', 'spec/config_spec.lua', 'spec/typed_spec.lua',
   'spec/core_spec.lua', 'spec/wave_spec.lua', 'spec/contract_spec.lua',
-  'spec/roblox_spec.lua',
+  'spec/roblox_spec.lua', 'spec/identify_spec.lua', 'spec/campaign_link_spec.lua',
 }
 local passed, failed = 0, 0
 
